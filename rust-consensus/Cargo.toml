@@ -1,0 +1,31 @@
+[package]
+name = "plato_consensus"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance token-level consensus for Plato tour-guide system"
+repository = "https://github.com/SuperInstance/plato-tour-guide"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rayon = "1.10"
+lru = "0.12"
+unicode-normalization = "0.1"
+unicode-segmentation = "1.12"
+parking_lot = "0.12"
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+mimalloc = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+
+[[bench]]
+name = "consensus"
+harness = false
+
+[features]
+default = []
+python = ["pyo3"]
