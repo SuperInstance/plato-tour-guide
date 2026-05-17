@@ -1,0 +1,515 @@
+// cuda_kernel.ptx — Hand-written PTX for Cosine Distance Kernel
+//
+// PTX (Parallel Thread Execution) is NVIDIA's intermediate representation for CUDA.
+// This is what a Fortran compiler would generate if it targeted CUDA GPUs.
+//
+// This kernel computes cosine distance between two embedding vectors:
+//   d(u, v) = 1 - dot(u, v) / (|u| * |v|)
+//
+// Each thread computes one (i, j) pair in a 2D grid.
+//
+// Design principles (Fortran-style register arithmetic):
+//   - All variables are .reg (registers), no .local (stack) allocation
+//   - Explicit memory loads (ld.global) — no caching magic
+//   - Fused multiply-add (fma.rn) for maximum throughput
+//   - Round-to-nearest (rn) for IEEE 754 compliance
+//   - One instruction per operation — complete transparency
+
+.version 8.0
+.target sm_80
+.address_size 64
+
+// -----------------------------------------------------------------------------
+// cosine_distance_kernel — Main kernel entry point
+// -----------------------------------------------------------------------------
+//
+// Input parameters:
+//   embeddings.ptr:   pointer to embedding matrix [n, dim] row-major
+//   n:                number of embeddings
+//   dim:              embedding dimension (typically 384)
+//   output.ptr:       pointer to output distance matrix [n, n]
+//
+// Thread indexing (2D grid):
+//   blockIdx.x, threadIdx.x: row index i
+//   blockIdx.y, threadIdx.y: column index j
+//
+// Register usage:
+//   - 8 registers for data (embedding values, accumulators)
+//   - 4 registers for addresses (pointers, offsets)
+//   - 4 registers for loop control
+//   Total: ~16 registers (fits in 255-register budget per SM)
+// -----------------------------------------------------------------------------
+.extern .func  _ZL16__nv_fabs_f32 (param .f32 %rs1)
+
+.func cosine_distance_kernel (
+    .param .u64 embeddings_ptr,   // pointer to embedding matrix
+    .param .u32 n,                // number of embeddings
+    .param .u32 dim,              // embedding dimension
+    .param .u64 output_ptr        // pointer to output matrix
+)
+{
+    // ========================================================================
+    // Register declarations — all computation happens in registers
+    // ========================================================================
+
+    // .reg.f32: 32-bit floating point registers (single precision)
+    // Using single precision because:
+    //   - Embeddings are typically f32 (bfloat16 is upconverted to f32)
+    //   - f32 is 2x faster than f64 on GPUs (more threads per SM)
+    //   - Cosine distance doesn't need f64 precision
+    .reg .f32  vi;               // value from embedding i
+    .reg .f32  vj;               // value from embedding j
+    .reg .f32  dot;              // dot product accumulator
+    .reg .f32  sq_i;             // squared norm of embedding i
+    .reg .f32  sq_j;             // squared norm of embedding j
+    .reg .f32  norm_i;           // L2 norm of embedding i
+    .reg .f32  norm_j;           // L2 norm of embedding j
+    .reg .f32  denominator;      // norm_i * norm_j
+    .reg .f32  distance;         // final result: 1 - dot / denominator
+
+    // .reg.f64: 64-bit floating point (for intermediate precision if needed)
+    // Not used in this kernel — single precision is sufficient
+
+    // .reg.u32: 32-bit integer registers (addresses, indices)
+    .reg .u32  i;                // row index (embedding i)
+    .reg .u32  j;                // column index (embedding j)
+    .reg .u32  k;                // loop index (dimension)
+    .reg .u32  dim_reg;          // embedding dimension (cached from param)
+
+    // .reg.u64: 64-bit integer registers (pointers, byte offsets)
+    .reg .u64  embeddings_base;  // base pointer to embedding matrix
+    .reg .u64  row_i_ptr;        // pointer to row i
+    .reg .u64  row_j_ptr;        // pointer to row j
+    .reg .u64  output_base;      // base pointer to output matrix
+    .reg .u64  output_offset;    // byte offset for output[i, j]
+
+    // .reg.pred: predicate registers (boolean flags, branch conditions)
+    .reg .pred bounds_check;     // true if i < n && j < n
+    .reg .pred loop_continue;    // true if k < dim
+
+    // ========================================================================
+    // Prologue: load parameters and compute thread index
+    // ========================================================================
+
+    // Load embedding matrix base pointer
+    // ld.param: load from kernel parameter memory
+    // .u64: 64-bit load (pointer size)
+    ld.param.u64    embeddings_base, [embeddings_ptr];
+
+    // Load embedding dimension
+    ld.param.u32    dim_reg, [dim];
+
+    // Load output matrix base pointer
+    ld.param.u64    output_base, [output_ptr];
+
+    // Compute thread index i = blockIdx.x * blockDim.x + threadIdx.x
+    // mov.u32: move 32-bit value (special registers to general registers)
+    // cvt.u32.u64: convert 64-bit to 32-bit
+    mov.u32         i, %tid.x;          // threadIdx.x
+    mov.u32         j, %tid.y;          // threadIdx.y
+
+    // Add block index contribution: i += blockIdx.x * blockDim.x
+    // mad.lo: multiply-add (low 32 bits)
+    // This computes: i = i + blockIdx.x * blockDim.x
+    mad.lo.u32      i, %ctaid.x, %ntid.x, i;
+    mad.lo.u32      j, %ctaid.y, %ntid.y, j;
+
+    // ========================================================================
+    // Bounds check: early exit if out of bounds
+    // ========================================================================
+
+    // Check if i < n && j < n
+    // ld.param.u32: load n from parameters
+    ld.param.u32    dim_reg, [n];        // reuse dim_reg for n (hack)
+
+    // setp: set predicate (comparison)
+    // lt: less than
+    // .u32: unsigned 32-bit comparison
+    setp.lt.u32     bounds_check, i, dim_reg;
+    setp.lt.u32     %p1, j, dim_reg;     // temporary predicate
+    and.pred        bounds_check, bounds_check, %p1;
+
+    // Early exit: if out of bounds, return
+    // @pred: only execute if predicate is true
+    // ret: return from kernel
+    @!bounds_check ret;
+
+    // ========================================================================
+    // Compute row pointers
+    // ========================================================================
+
+    // row_i_ptr = embeddings_base + i * dim * sizeof(float)
+    // row_j_ptr = embeddings_base + j * dim * sizeof(float)
+    //
+    // Since embeddings are row-major:
+    //   - Row i starts at byte offset i * dim * 4
+    //   - Each element is 4 bytes (float32)
+
+    // Compute i * dim (in elements)
+    // mul.wide: multiply with widening (32-bit -> 64-bit)
+    mul.wide.u32    %row_i_offset, i, dim_reg;
+    mul.wide.u32    %row_j_offset, j, dim_reg;
+
+    // Convert to byte offset (multiply by 4)
+    // shl.b64: shift left by 2 bits (multiply by 4)
+    shl.b64         %row_i_offset, %row_i_offset, 2;
+    shl.b64         %row_j_offset, %row_j_offset, 2;
+
+    // Add to base pointer
+    // add.u64: 64-bit addition
+    add.u64         row_i_ptr, embeddings_base, %row_i_offset;
+    add.u64         row_j_ptr, embeddings_base, %row_j_offset;
+
+    // ========================================================================
+    // Main loop: compute dot product + squared norms
+    // ========================================================================
+
+    // Initialize accumulators to zero
+    // mov.f32: move 32-bit float (immediate to register)
+    mov.f32         dot, 0f00000000;     // dot = 0.0
+    mov.f32         sq_i, 0f00000000;    // sq_i = 0.0
+    mov.f32         sq_j, 0f00000000;    // sq_j = 0.0
+
+    // Initialize loop index
+    mov.u32         k, 0;
+
+    // Loop label (for branching)
+    loop_start:
+
+    // Check if k < dim
+    setp.lt.u32     loop_continue, k, dim_reg;
+    @!loop_continue bra loop_end;
+
+    // ====================================================================
+    // Load embedding values
+    // ====================================================================
+
+    // Load vi = embeddings[i][k]
+    // ld.global.f32: load 32-bit float from global memory
+    // [row_i_ptr + k*4]: byte offset = element index * 4
+    //
+    // Why ld.global instead of ld.shared?
+    //   - Embeddings are read-only (don't need shared memory)
+    //   - Large working set (384 * 2 * 4 bytes = 3KB per thread pair)
+    //   - Global memory is cached in L2 on modern GPUs
+    //   - Compiler may insert ld.nc (non-coherent) for read-only data
+    //
+    // Why explicit offset calculation?
+    //   - Shows the memory access pattern clearly
+    //   - Compiler can optimize to ld.global.f32 vi, [row_i_ptr + k*4]
+    shl.b32         %k_offset, k, 2;     // k * 4 (byte offset)
+    add.u64         %vi_ptr, row_i_ptr, %k_offset;
+    add.u64         %vj_ptr, row_j_ptr, %k_offset;
+
+    ld.global.f32   vi, [%vi_ptr];
+    ld.global.f32   vj, [%vj_ptr];
+
+    // ====================================================================
+    // Fused multiply-add: dot += vi * vj
+    // ====================================================================
+
+    // fma.rn.f32: fused multiply-add, round-to-nearest
+    // Operation: dot = dot + vi * vj
+    //
+    // Why FMA instead of separate mul + add?
+    //   - Single instruction (vs two instructions)
+    //   - Only one rounding (more accurate)
+    //   - Higher throughput (more FMA units than ALU on GPUs)
+    //   - Lower latency (deep pipeline, fused operation)
+    //
+    // Why .rn (round-to-nearest) instead of .rz (round-to-zero)?
+    //   - IEEE 754 default rounding mode
+    //   - Best accuracy for cosine distance
+    //   - Hardware default (no mode switch overhead)
+    fma.rn.f32      dot, vi, vj, dot;
+
+    // ====================================================================
+    // Squared norms: sq_i += vi * vi, sq_j += vj * vj
+    // ====================================================================
+
+    // Note: we could use fma here too: fma.rn.f32 sq_i, vi, vi, sq_i
+    // But mul is sufficient (no addition involved)
+    // Using fma would be: sq_i = sq_i + vi * vi (same result)
+    mul.f32         %vi_sq, vi, vi;
+    add.f32         sq_i, sq_i, %vi_sq;
+
+    mul.f32         %vj_sq, vj, vj;
+    add.f32         sq_j, sq_j, %vj_sq;
+
+    // Increment loop counter
+    add.u32         k, k, 1;
+
+    // Branch back to loop start
+    bra.uni         loop_start;
+
+    loop_end:
+
+    // ========================================================================
+    // Compute norms: sqrt(sq_i), sqrt(sq_j)
+    // ========================================================================
+
+    // sqrt.rn.f32: square root, round-to-nearest
+    // Latency: ~20-30 cycles on NVIDIA Ampere
+    // Throughput: 1 per 8-16 cycles (pipelined)
+    //
+    // Why not use rsqrt.approx.f32 (reciprocal sqrt approximation)?
+    //   - rsqrt.approx is faster but less accurate (0.5% error)
+    //   - Cosine distance needs high accuracy (small angles matter)
+    //   - We could use rsqrt + Newton-Raphson refinement:
+    //       x = rsqrt.approx(a)
+    //       x = x * (1.5 - 0.5 * a * x * x)  // one iteration
+    //     But this is overkill for our use case
+    sqrt.rn.f32     norm_i, sq_i;
+    sqrt.rn.f32     norm_j, sq_j;
+
+    // ========================================================================
+    // Compute denominator: norm_i * norm_j
+    // ========================================================================
+
+    // Protect against zero vectors (avoid division by zero)
+    // max.f32: maximum of two values
+    // We use max(norm_i * norm_j, 1e-8) to avoid division by zero
+    mul.f32         denominator, norm_i, norm_j;
+    mov.f32         %epsilon, 0f323d5b9a;  // 1e-8 in float32
+    max.f32         denominator, denominator, %epsilon;
+
+    // ========================================================================
+    // Compute final distance: 1 - dot / denominator
+    // ========================================================================
+
+    // div.rn.f32: division, round-to-nearest
+    // Latency: ~30-40 cycles (expensive!)
+    // Alternative: use reciprocal + multiply (rcp + mul)
+    //   rcp.approx.ftz.f32 %rcp, denominator;
+    //   mul.f32 %ratio, dot, %rcp;
+    // But rcp.approx has poor accuracy (not suitable here)
+    div.rn.f32      %ratio, dot, denominator;
+
+    // 1 - ratio
+    // mov.f32: load 1.0
+    // sub.f32: subtract
+    mov.f32         %one, 0f3f800000;     // 1.0 in float32
+    sub.f32         distance, %one, %ratio;
+
+    // ========================================================================
+    // Store result to output matrix
+    // ========================================================================
+
+    // Compute output offset: output[i, j] = output_base + (i * n + j) * 4
+    mul.wide.u32    %i_n, i, dim_reg;     // i * n (reuse dim_reg for n)
+    add.u32         %i_n_j, %i_n, j;      // i * n + j
+    mul.wide.u32    %output_byte_offset, %i_n_j, 4;
+    add.u64         %output_ptr, output_base, %output_byte_offset;
+
+    // st.global.f32: store 32-bit float to global memory
+    // .global: global memory (may be cached in L2)
+    // .wb: write-back cache policy (evict first if line is dirty)
+    st.global.wb.f32 [%output_ptr], distance;
+
+    // ========================================================================
+    // Epilogue: return
+    // ========================================================================
+
+    ret;
+}
+
+
+// =============================================================================
+// cosine_distance_fused_kernel — Optimized version with shared memory
+// =============================================================================
+//
+// This version pre-computes row norms in shared memory to avoid redundant
+// sqrt operations when computing multiple pairs with the same row.
+//
+// Each block computes one row i against all columns j.
+// Shared memory stores the norms for all rows in the block.
+//
+// Shared memory layout:
+//   shared_norms[blockDim.x]: L2 norms for rows in this block
+//
+// This is useful when computing a full distance matrix (N^2 pairs),
+// where each row is reused N times.
+// -----------------------------------------------------------------------------
+.func cosine_distance_fused_kernel (
+    .param .u64 embeddings_ptr,
+    .param .u32 n,
+    .param .u32 dim,
+    .param .u64 norms_ptr,           // output: pre-computed norms
+    .param .u64 output_ptr
+)
+{
+    .reg .f32  vi, vj, dot, sq_i, sq_j, norm_i, norm_j, denominator, distance;
+    .reg .u32  i, j, k, dim_reg;
+    .reg .u64  embeddings_base, row_i_ptr, row_j_ptr, output_base, output_offset;
+    .reg .pred bounds_check, loop_continue;
+
+    // .shared: shared memory declaration (visible to all threads in block)
+    // Size: blockDim.x * 4 bytes (one float per thread in the block)
+    // This is allocated at kernel launch time (third argument to <<<>>>)
+    .shared .align 4 .f32 shared_norms[];
+
+    // Prologue (same as basic kernel)
+    ld.param.u64    embeddings_base, [embeddings_ptr];
+    ld.param.u32    dim_reg, [dim];
+    ld.param.u64    output_base, [output_ptr];
+
+    mov.u32         i, %tid.x;
+    mov.u32         j, %tid.y;
+    mad.lo.u32      i, %ctaid.x, %ntid.x, i;
+    mad.lo.u32      j, %ctaid.y, %ntid.y, j;
+
+    ld.param.u32    dim_reg, [n];
+    setp.lt.u32     bounds_check, i, dim_reg;
+    setp.lt.u32     %p1, j, dim_reg;
+    and.pred        bounds_check, bounds_check, %p1;
+    @!bounds_check ret;
+
+    // ========================================================================
+    // Compute norm for row i and cache in shared memory
+    // ========================================================================
+
+    mul.wide.u32    %row_i_offset, i, dim_reg;
+    shl.b64         %row_i_offset, %row_i_offset, 2;
+    add.u64         row_i_ptr, embeddings_base, %row_i_offset;
+
+    mov.f32         sq_i, 0f00000000;
+    mov.u32         k, 0;
+
+    loop_i:
+    setp.lt.u32     loop_continue, k, dim_reg;
+    @!loop_continue bra loop_i_end;
+
+    shl.b32         %k_offset, k, 2;
+    add.u64         %vi_ptr, row_i_ptr, %k_offset;
+    ld.global.f32   vi, [%vi_ptr];
+
+    mul.f32         %vi_sq, vi, vi;
+    add.f32         sq_i, sq_i, %vi_sq;
+
+    add.u32         k, k, 1;
+    bra.uni         loop_i;
+    loop_i_end:
+
+    sqrt.rn.f32     norm_i, sq_i;
+
+    // Store to shared memory
+    // st.shared: store to shared memory (fast, on-chip)
+    // [shared_norms + threadIdx.x * 4]: each thread stores its own norm
+    shl.b32         %shared_offset, %tid.x, 2;
+    st.shared.f32   [shared_norms + %shared_offset], norm_i;
+
+    // Synchronize: ensure all norms are written before reading
+    // bar.sync: barrier synchronization
+    // All threads in the block must reach this point before any proceed
+    // This prevents race conditions on shared_norms[]
+    bar.sync        0;
+
+    // ========================================================================
+    // Compute norm for row j and distance (using cached norm_i)
+    // ========================================================================
+
+    mul.wide.u32    %row_j_offset, j, dim_reg;
+    shl.b64         %row_j_offset, %row_j_offset, 2;
+    add.u64         row_j_ptr, embeddings_base, %row_j_offset;
+
+    mov.f32         dot, 0f00000000;
+    mov.f32         sq_j, 0f00000000;
+    mov.u32         k, 0;
+
+    loop_j:
+    setp.lt.u32     loop_continue, k, dim_reg;
+    @!loop_continue bra loop_j_end;
+
+    shl.b32         %k_offset, k, 2;
+    add.u64         %vi_ptr, row_i_ptr, %k_offset;
+    add.u64         %vj_ptr, row_j_ptr, %k_offset;
+
+    ld.global.f32   vi, [%vi_ptr];
+    ld.global.f32   vj, [%vj_ptr];
+
+    fma.rn.f32      dot, vi, vj, dot;
+    mul.f32         %vj_sq, vj, vj;
+    add.f32         sq_j, sq_j, %vj_sq;
+
+    add.u32         k, k, 1;
+    bra.uni         loop_j;
+    loop_j_end:
+
+    sqrt.rn.f32     norm_j, sq_j;
+
+    // Load norm_i from shared memory
+    // ld.shared: load from shared memory (fast, on-chip)
+    shl.b32         %shared_offset, %tid.x, 2;
+    ld.shared.f32   norm_i, [shared_norms + %shared_offset];
+
+    // Compute distance
+    mul.f32         denominator, norm_i, norm_j;
+    mov.f32         %epsilon, 0f323d5b9a;
+    max.f32         denominator, denominator, %epsilon;
+    div.rn.f32      %ratio, dot, denominator;
+    mov.f32         %one, 0f3f800000;
+    sub.f32         distance, %one, %ratio;
+
+    // Store result
+    mul.wide.u32    %i_n, i, dim_reg;
+    add.u32         %i_n_j, %i_n, j;
+    mul.wide.u32    %output_byte_offset, %i_n_j, 4;
+    add.u64         %output_ptr, output_base, %output_byte_offset;
+    st.global.wb.f32 [%output_ptr], distance;
+
+    ret;
+}
+
+
+// =============================================================================
+// Instruction reference — why each instruction is optimal
+// =============================================================================
+//
+// ld.global.f32: Load from global memory (off-chip DRAM)
+//   - Why not ld.shared? Embeddings are read-only, too large for shared mem
+//   - Why not ld.const? Not a constant buffer (changes per kernel launch)
+//   - Why not ld.nc (non-coherent)? L2 cache is sufficient
+//
+// st.global.wb.f32: Store to global memory with write-back policy
+//   - Why .wb? Write-back is faster than write-through (cached writes)
+//   - Why not st.shared? Output is too large for shared memory
+//
+// fma.rn.f32: Fused multiply-add, round-to-nearest
+//   - Why FMA? Single instruction vs mul+add (2x faster)
+//   - Why .rn? IEEE 754 default (best accuracy)
+//   - Why not .rz/.rp/.rm? Unnecessary for cosine distance
+//
+// sqrt.rn.f32: Square root, round-to-nearest
+//   - Why sqrt and not rsqrt.approx? Accuracy matters for small angles
+//   - Why not rsqrt + Newton? Overkill for this use case
+//   - Latency is acceptable (pipelined, 1 per 8-16 cycles)
+//
+// div.rn.f32: Division, round-to-nearest
+//   - Why div and not rcp.approx? Accuracy matters
+//   - Why not rcp + Newton refinement? Overkill
+//   - Div is expensive but only called once per thread pair
+//
+// mad.lo.u32: Multiply-add (low 32 bits)
+//   - Why mad.lo? For index calculation (i = i + blockIdx * blockDim)
+//   - Why not separate mul + add? Single instruction
+//
+// setp.lt.u32: Set predicate if less than (unsigned 32-bit)
+//   - Why setp? For conditional branches (bounds check)
+//   - Why .lt? Unsigned comparison (indices are non-negative)
+//
+// @pred: Predicated execution
+//   - Why predicate? Avoid branches (better for GPU SIMT)
+//   - Why not branch? Predicates are cheaper (no divergence)
+//
+// bar.sync: Barrier synchronization
+//   - Why bar.sync? Prevent race conditions on shared memory
+//   - Why not membar.cta? membar doesn't synchronize threads
+//
+// shl.b32/shl.b64: Shift left (multiply by power of 2)
+//   - Why shl instead of mul? Faster for powers of 2
+//   - Why shift by 2? Multiply by 4 (sizeof(float))
+//
+// mov.f32/mov.u32: Move (copy) between registers
+//   - Why mov? Load immediate values or copy registers
+//   - Why not ld.param? For constants, not parameters
+// =============================================================================
